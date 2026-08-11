@@ -156,15 +156,38 @@ function parseBoto3Index(content: string, source: SourceConfig): ParseResult {
   }
 
   const serviceName = source.id === "boto3_control_plane" ? "bedrock-agentcore-control" : "bedrock-agentcore";
-  const component: ComponentSummary = {
+
+  // One ComponentSummary per inferred AgentCore domain, not one per source.
+  // list_agentcore_components filters on ComponentSummary.name, so a single
+  // source-named summary made `component: "memory"` report "no components
+  // found" even though the memory method entries exist and are searchable.
+  // The source id stays a valid filter so `source: boto3_data_plane` still works.
+  const byComponent = new Map<string, Array<{ title: string; description: string }>>();
+  for (const entry of entries) {
+    const group = byComponent.get(entry.component) ?? [];
+    group.push({ title: entry.title, description: "" });
+    byComponent.set(entry.component, group);
+  }
+
+  const components: ComponentSummary[] = [...byComponent].map(([name, subPages]) => ({
+    name,
+    sectionTitle: `Boto3 ${serviceName} Client — ${name}`,
+    sectionUrl: source.indexUrl,
+    sourceId: source.id,
+    subPages,
+  }));
+
+  // ponytail: keep the flat all-methods summary too — it's the only place the
+  // full client method list appears, and `source: boto3_*` overviews rely on it.
+  components.push({
     name: source.id,
     sectionTitle: `Boto3 ${serviceName} Client`,
     sectionUrl: source.indexUrl,
     sourceId: source.id,
     subPages: methods,
-  };
+  });
 
-  return { entries, components: [component] };
+  return { entries, components };
 }
 
 function parseGithubReadme(content: string, source: SourceConfig): ParseResult {
@@ -550,10 +573,28 @@ export function buildComponentOverview(comp: ComponentSummary): string {
   return overview;
 }
 
+/**
+ * Words too common in natural-language questions ("how do I deploy an agent")
+ * or in AWS reference titles ("Common Parameters", "API Reference") to carry
+ * signal. Without this, a query's stopwords score the same +10 title hit as its
+ * one distinctive term, so generic pages outrank the exact match — "CreateGateway
+ * parameters" ranked CreateGateway below two "Common Parameters" pages.
+ */
+const STOPWORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "by", "do", "does", "for", "from",
+  "how", "in", "is", "it", "me", "my", "of", "on", "or", "the", "to", "use",
+  "using", "what", "when", "where", "which", "who", "why", "with", "you", "your",
+  "common", "guide", "overview", "parameters", "reference",
+]);
+
 export function searchEntries(entries: DocEntry[], query: string, options?: { sourceId?: string; maxResults?: number }): DocEntry[] {
   const { sourceId, maxResults = 5 } = options || {};
   const queryLower = query.toLowerCase();
-  const terms = queryLower.split(/\s+/).filter(t => t.length > 1);
+  const rawTerms = queryLower.split(/\s+/).filter(t => t.length > 1);
+  // Keep the raw terms when a query is nothing but stopwords, so
+  // "what is a gateway" still beats returning nothing at all.
+  const meaningful = rawTerms.filter(t => !STOPWORDS.has(t));
+  const terms = meaningful.length > 0 ? meaningful : rawTerms;
 
   let pool = entries;
   if (sourceId && sourceId !== "all") pool = pool.filter(e => e.sourceId === sourceId);

@@ -41,7 +41,7 @@ export function clearCache(): void {
 export function fetchRawUrl(url: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const client = url.startsWith("https") ? https : http;
-    const req = client.get(url, { headers: { "User-Agent": "AgentCore-Assistant/4.3" } }, (res) => {
+    const req = client.get(url, { headers: { "User-Agent": "AgentCore-Assistant/4.4" } }, (res) => {
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         fetchRawUrl(res.headers.location).then(resolve).catch(reject);
         return;

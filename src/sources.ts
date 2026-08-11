@@ -175,3 +175,42 @@ export function getEnabledSources(): SourceConfig[] {
 export function getAllSourceIds(): string[] {
   return ALL_SOURCES.map(s => s.id);
 }
+
+/**
+ * Hostnames the doc fetcher is allowed to reach, derived from ALL_SOURCES so it
+ * can never drift from the source list. Without this, fetch_agentcore_doc would
+ * retrieve any URL — including internal hosts — and hand the response back
+ * through the trusted tool-result channel.
+ *
+ * Derived from every source regardless of AGENTCORE_SOURCES: disabling a source
+ * shouldn't make a URL the model found earlier suddenly unfetchable.
+ */
+const ALLOWED_HOSTS: Set<string> = new Set(
+  ALL_SOURCES.flatMap(s => {
+    try {
+      return [new URL(s.indexUrl).hostname, new URL(s.baseUrl).hostname];
+    } catch {
+      return [];
+    }
+  })
+);
+
+/**
+ * True when `url` is an https URL on a documentation host this server indexes.
+ * Subdomain matching is exact — "evil-docs.aws.amazon.com.attacker.net" must not
+ * pass because it ends with an allowed host's characters.
+ */
+export function isAllowedDocUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") return false;
+  return ALLOWED_HOSTS.has(parsed.hostname);
+}
+
+export function getAllowedHosts(): string[] {
+  return [...ALLOWED_HOSTS].sort();
+}

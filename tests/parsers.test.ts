@@ -183,8 +183,20 @@ describe("parsers (via getIndex/getComponents)", () => {
       expect(entries.map(e => e.title)).not.toContain("can_paginate");
       expect(entries.map(e => e.title)).not.toContain("close");
 
-      expect(components.length).toBe(1);
-      expect(components[0].name).toBe("boto3_data_plane");
+      // One summary per inferred AgentCore domain, plus the flat all-methods
+      // summary named after the source. A single source-named summary made
+      // list_agentcore_components report "no components found" for
+      // `component: "memory"` even though memory method entries exist.
+      const names = components.map(c => c.name);
+      expect(names).toContain("boto3_data_plane");
+      expect(names).toContain("harness");
+      expect(names).toContain("browser");
+
+      // Grouped by the component each method infers, so a domain filter finds them.
+      expect(components.find(c => c.name === "harness")!.subPages.map(p => p.title)).toEqual(["invoke_harness"]);
+      expect(components.find(c => c.name === "browser")!.subPages.map(p => p.title)).toEqual(["start_browser_session"]);
+      // The flat all-methods summary is still there for `source:` overviews.
+      expect(components.find(c => c.name === "boto3_data_plane")!.subPages.length).toBe(3);
     });
 
     it("constructs correct URLs for methods", async () => {

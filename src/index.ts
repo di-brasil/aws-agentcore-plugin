@@ -23,14 +23,14 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { getIndex, getComponents, searchEntries, buildComponentOverview } from "./doc-index.js";
 import { fetchDocPage } from "./fetcher.js";
-import { getEnabledSources, getAllSourceIds } from "./sources.js";
+import { getEnabledSources, getAllSourceIds, isAllowedDocUrl, getAllowedHosts } from "./sources.js";
 
 const enabledSources = getEnabledSources();
 const sourceNames = enabledSources.map(s => `${s.id} (${s.name})`).join(", ");
 
 const server = new McpServer({
   name: "agentcore-assistant",
-  version: "4.3.0",
+  version: "4.4.0",
   description: `Amazon Bedrock AgentCore is a fully managed AWS platform for building, deploying, and operating AI agents at scale. It provides: Runtime (serverless agent hosting with session isolation in microVMs, supporting any framework — Strands, LangGraph, CrewAI, Google ADK, OpenAI Agents SDK), Harness (managed agent loop via configuration — no code needed), Memory (short-term and long-term memory with semantic, summary, user-preference, and episodic strategies), Gateway (unified AI gateway connecting agents to tools via MCP, HTTP, and inference routing with 1-click integrations for Slack, Jira, Salesforce), Identity (workload identity, OAuth, API keys, Token Vault), Browser (managed remote Chrome for web automation), Code Interpreter (sandboxed Python/JS/TS execution), Web Search (managed search with no API keys), Observability (OpenTelemetry tracing via CloudWatch), Policy (Cedar-based fine-grained access control), Evaluations (13 built-in evaluators for continuous quality scoring), and Agent Registry (discover and share agents across an org). This MCP server provides live documentation, API references, boto3 methods, Python SDK, CDK constructs (TypeScript/Python/Java/.NET/Go), CloudFormation templates, and FAQs from ${enabledSources.length} official AWS sources (${enabledSources.map(s => s.id).join(", ")}). Uses stdio transport — no ports, no conflicts. All content fetched dynamically — never stale.`,
 });
 
@@ -97,6 +97,8 @@ server.tool(
 
 Returns ranked results with live content snippets. The index covers 1800+ pages across all enabled sources, dynamically discovered from official AWS manifests.
 
+The top 3 results with distinct URLs are hydrated with a live 1500-character snippet; any further results (up to \`max_results\`) are listed as links only. Raising \`max_results\` gets you more links, not more snippets — use \`fetch_agentcore_doc\` on a URL for its full content.
+
 Filter by source to narrow results:
 - "docs" — Developer guide (how-to, concepts, getting started)
 - "api_data_plane" — API operations for invoking agents, memory, browser, etc.
@@ -137,8 +139,22 @@ Tip: Call list_agentcore_components first to understand available terminology.`,
       };
     }
 
+    // Hydrate the top 3 DISTINCT URLs. Several entries can share one URL — all
+    // 52 FAQ questions come from a single page, and a few devguide pages are
+    // also listed by the sdk source — so hydrating by rank alone fetched the
+    // same page 3 times and emitted 3 identical snippets under 3 different
+    // headings. Everything not hydrated still appears under "More results".
+    const toHydrate: typeof results = [];
+    const hydratedUrls = new Set<string>();
+    for (const entry of results) {
+      if (toHydrate.length >= 3) break;
+      if (hydratedUrls.has(entry.url)) continue;
+      hydratedUrls.add(entry.url);
+      toHydrate.push(entry);
+    }
+
     const hydrated: string[] = [];
-    for (const entry of results.slice(0, 3)) {
+    for (const entry of toHydrate) {
       try {
         const content = await fetchDocPage(entry.url);
         const snippet = content.slice(0, 1500);
@@ -160,7 +176,7 @@ Tip: Call list_agentcore_components first to understand available terminology.`,
       }
     }
 
-    const remaining = results.slice(3);
+    const remaining = results.filter(e => !toHydrate.includes(e));
     let remainingText = "";
     if (remaining.length > 0) {
       remainingText = "\n\n---\n\n**More results:**\n" +
@@ -185,19 +201,45 @@ Use when search snippets are truncated and you need:
 
 Works with any URL from the search results — developer guide, API reference, boto3 reference, or SDK pages.
 
+Returns at most 20000 characters per call. Large pages (the CDK references run
+past 150000 characters) are truncated, and the truncation notice reports the
+total length and the exact \`offset\` to pass next. Page through with \`offset\`
+to reach content beyond the first window — that is the only way to read the
+later part of a single-page reference, since there is no narrower page to ask for.
+
 Results are cached locally (default 60 min TTL) so repeated fetches are instant.`,
   {
     url: z.string().describe("Full URL to fetch from search results"),
+    offset: z.number().min(0).optional().describe("Character offset to start from. Use the value reported in a previous truncation notice to page through a large page. Default: 0"),
   },
-  async ({ url }) => {
+  async ({ url, offset }) => {
+    if (!isAllowedDocUrl(url)) {
+      return {
+        content: [{
+          type: "text",
+          text: `Refused to fetch ${url}\n\nThis tool only fetches https pages from the AgentCore documentation hosts it indexes: ${getAllowedHosts().join(", ")}.\n\nUse search_agentcore_docs to find a documentation URL.`
+        }]
+      };
+    }
     try {
       const content = await fetchDocPage(url);
       const MAX_CHARS = 20000;
-      const body = content.length > MAX_CHARS
-        ? `${content.slice(0, MAX_CHARS)}\n\n*[Truncated at ${MAX_CHARS} characters — page is ${content.length} characters. Ask for a narrower section or a different page if you need more.]*`
-        : content;
+      const start = Math.min(offset ?? 0, content.length);
+      const body = content.slice(start, start + MAX_CHARS);
+      const end = start + body.length;
+
+      let notice = "";
+      if (start > 0) {
+        notice += `*[Resumed at character ${start} of ${content.length}.]*\n\n`;
+      }
+      if (end < content.length) {
+        notice = `${notice}${body}\n\n*[Truncated at ${end} of ${content.length} characters — call again with offset=${end} for the next section.]*`;
+      } else {
+        notice += body;
+      }
+
       return {
-        content: [{ type: "text", text: `**Source:** ${url}\n\n---\n\n${body}` }]
+        content: [{ type: "text", text: `**Source:** ${url}\n\n---\n\n${notice}` }]
       };
     } catch (err) {
       return {

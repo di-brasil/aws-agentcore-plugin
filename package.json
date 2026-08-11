@@ -1,6 +1,6 @@
 {
   "name": "agentcore-assistant",
-  "version": "4.3.0",
+  "version": "4.4.0",
   "description": "MCP server that gives AI coding assistants accurate, always-fresh knowledge about Amazon Bedrock AgentCore. Indexes 1800+ pages from 13 live official AWS sources (developer guide, data/control plane APIs, boto3, Python SDK, CloudFormation, CDK for 5 languages, FAQs) with zero static content. All documentation fetched on demand with configurable local caching.",
   "main": "dist/index.js",
   "bin": {

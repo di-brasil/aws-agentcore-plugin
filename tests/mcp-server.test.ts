@@ -98,7 +98,7 @@ describe("MCP Server E2E", () => {
       const response = await freshClient.initialize();
       expect(response.result).toBeDefined();
       expect(response.result.serverInfo.name).toBe("agentcore-assistant");
-      expect(response.result.serverInfo.version).toBe("4.3.0");
+      expect(response.result.serverInfo.version).toBe("4.4.0");
       freshClient.close();
     });
   });
@@ -205,13 +205,69 @@ describe("MCP Server E2E", () => {
       expect(text.length).toBeGreaterThan(500);
     });
 
-    it("returns error for completely invalid URL", async () => {
+    it("refuses a URL outside the documentation hosts", async () => {
       const response = await client.callTool("fetch_agentcore_doc", {
         url: "https://this-domain-does-not-exist-xyz123456.invalid/page.html",
       });
       const text = response.result.content[0].text;
-      expect(text).toContain("Failed to fetch");
+      expect(text).toContain("Refused to fetch");
+      expect(text).toContain("docs.aws.amazon.com");
     });
+
+    it("pages past the 20000-character cap with offset", async () => {
+      // The CDK Java reference is ~190k characters. Before offset existed, the
+      // later 89% of the page was unreachable: CfnGateway sorts after the cut,
+      // these are single-page sources so there is no narrower page to ask for,
+      // and construct names are not indexed for search.
+      const url = "https://docs.aws.amazon.com/cdk/api/v2/java/software/amazon/awscdk/cfnpropertymixins/services/bedrockagentcore/package-summary.html";
+
+      const first = await client.callTool("fetch_agentcore_doc", { url });
+      const firstText = first.result.content[0].text;
+      expect(firstText).toContain("call again with offset=");
+
+      const nextOffset = Number(firstText.match(/offset=(\d+)/)![1]);
+      expect(nextOffset).toBe(20000);
+
+      const second = await client.callTool("fetch_agentcore_doc", { url, offset: nextOffset });
+      const secondText = second.result.content[0].text;
+      expect(secondText).toContain("Resumed at character 20000");
+      // Genuinely new content, not a repeat of the first window.
+      expect(secondText).not.toContain("CfnApiKeyCredentialProviderMixinProps");
+    });
+
+    it("clamps an offset past the end instead of erroring", async () => {
+      const response = await client.callTool("fetch_agentcore_doc", {
+        url: "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness.html",
+        offset: 99_000_000,
+      });
+      const text = response.result.content[0].text;
+      expect(text).toContain("**Source:**");
+      expect(text).not.toContain("call again with offset=");
+    });
+  });
+});
+
+describe("search_agentcore_docs hydration", () => {
+  it("hydrates 3 distinct URLs, not the same page 3 times", async () => {
+    // Every FAQ question shares the FAQ page URL, so ranking alone used to
+    // hydrate one page 3 times and print 3 identical bodies under 3 headings.
+    const faqClient = new McpTestClient({ AGENTCORE_SOURCES: "faq" });
+    await faqClient.initialize();
+
+    const response = await faqClient.callTool("search_agentcore_docs", {
+      query: "charged pricing cost",
+      source: "faq",
+      max_results: 5,
+    });
+    const text = response.result.content[0].text;
+
+    // One hydrated block, because the FAQ source only has one distinct URL.
+    const hydratedBlocks = text.match(/^\*\*URL:\*\*/gm) || [];
+    expect(hydratedBlocks.length).toBe(1);
+    // The rest still reach the model as links.
+    expect(text).toContain("**More results:**");
+
+    faqClient.close();
   });
 });
 

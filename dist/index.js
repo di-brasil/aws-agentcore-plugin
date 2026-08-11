@@ -6593,6 +6593,7 @@ var require_formats = __commonJS({
       // uri-template: https://tools.ietf.org/html/rfc6570
       "uri-template": /^(?:(?:[^\x00-\x20"'<>%\\^`{|}]|%[0-9a-f]{2})|\{[+#./;?&=,!@|]?(?:[a-z0-9_]|%[0-9a-f]{2})+(?::[1-9][0-9]{0,3}|\*)?(?:,(?:[a-z0-9_]|%[0-9a-f]{2})+(?::[1-9][0-9]{0,3}|\*)?)*\})*$/i,
       // For the source: https://gist.github.com/dperini/729294
+      // For test cases: https://mathiasbynens.be/demo/url-regex
       url: /^(?:https?|ftp):\/\/(?:\S+(?::\S*)?@)?(?:(?!(?:10|127)(?:\.\d{1,3}){3})(?!(?:169\.254|192\.168)(?:\.\d{1,3}){2})(?!172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(?:[1-9]\d?|1\d\d|2[01]\d|22[0-3])(?:\.(?:1?\d{1,2}|2[0-4]\d|25[0-5])){2}(?:\.(?:[1-9]\d?|1\d\d|2[0-4]\d|25[0-4]))|(?:(?:[a-z0-9\u{00a1}-\u{ffff}]+-)*[a-z0-9\u{00a1}-\u{ffff}]+)(?:\.(?:[a-z0-9\u{00a1}-\u{ffff}]+-)*[a-z0-9\u{00a1}-\u{ffff}]+)*(?:\.(?:[a-z\u{00a1}-\u{ffff}]{2,})))(?::\d{2,5})?(?:\/[^\s]*)?$/iu,
       email: /^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i,
       hostname: /^(?=.{1,253}\.?$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[-0-9a-z]{0,61}[0-9a-z])?)*\.?$/i,
@@ -21113,7 +21114,7 @@ function getCacheTTL() {
 function fetchRawUrl(url) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith("https") ? import_node_https.default : import_node_http.default;
-    const req = client.get(url, { headers: { "User-Agent": "AgentCore-Assistant/4.3" } }, (res) => {
+    const req = client.get(url, { headers: { "User-Agent": "AgentCore-Assistant/4.4" } }, (res) => {
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         fetchRawUrl(res.headers.location).then(resolve).catch(reject);
         return;
@@ -21415,6 +21416,28 @@ function getEnabledSources() {
 function getAllSourceIds() {
   return ALL_SOURCES.map((s) => s.id);
 }
+var ALLOWED_HOSTS = new Set(
+  ALL_SOURCES.flatMap((s) => {
+    try {
+      return [new URL(s.indexUrl).hostname, new URL(s.baseUrl).hostname];
+    } catch {
+      return [];
+    }
+  })
+);
+function isAllowedDocUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") return false;
+  return ALLOWED_HOSTS.has(parsed.hostname);
+}
+function getAllowedHosts() {
+  return [...ALLOWED_HOSTS].sort();
+}
 
 // src/doc-index.ts
 var _result = null;
@@ -21506,26 +21529,39 @@ function parseBoto3Index(content, source) {
     if (["can_paginate", "close", "get_paginator", "get_waiter"].includes(methodName)) continue;
     const url = source.baseUrl + relPath;
     const serviceName2 = source.id === "boto3_control_plane" ? "bedrock-agentcore-control" : "bedrock-agentcore";
-    const component2 = inferBoto3Component(methodName);
+    const component = inferBoto3Component(methodName);
     entries.push({
       url,
       title: methodName,
       description: `boto3 ${serviceName2} client method`,
       sourceId: source.id,
-      component: component2,
-      tags: [component2, source.id, "boto3", "sdk", "python", methodName.split("_")[0]]
+      component,
+      tags: [component, source.id, "boto3", "sdk", "python", methodName.split("_")[0]]
     });
     methods.push({ title: methodName, description: "" });
   }
   const serviceName = source.id === "boto3_control_plane" ? "bedrock-agentcore-control" : "bedrock-agentcore";
-  const component = {
+  const byComponent = /* @__PURE__ */ new Map();
+  for (const entry of entries) {
+    const group = byComponent.get(entry.component) ?? [];
+    group.push({ title: entry.title, description: "" });
+    byComponent.set(entry.component, group);
+  }
+  const components = [...byComponent].map(([name, subPages]) => ({
+    name,
+    sectionTitle: `Boto3 ${serviceName} Client \u2014 ${name}`,
+    sectionUrl: source.indexUrl,
+    sourceId: source.id,
+    subPages
+  }));
+  components.push({
     name: source.id,
     sectionTitle: `Boto3 ${serviceName} Client`,
     sectionUrl: source.indexUrl,
     sourceId: source.id,
     subPages: methods
-  };
-  return { entries, components: [component] };
+  });
+  return { entries, components };
 }
 function parseGithubReadme(content, source) {
   const entries = [];
@@ -21847,10 +21883,53 @@ function buildComponentOverview(comp) {
   }
   return overview;
 }
+var STOPWORDS = /* @__PURE__ */ new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "by",
+  "do",
+  "does",
+  "for",
+  "from",
+  "how",
+  "in",
+  "is",
+  "it",
+  "me",
+  "my",
+  "of",
+  "on",
+  "or",
+  "the",
+  "to",
+  "use",
+  "using",
+  "what",
+  "when",
+  "where",
+  "which",
+  "who",
+  "why",
+  "with",
+  "you",
+  "your",
+  "common",
+  "guide",
+  "overview",
+  "parameters",
+  "reference"
+]);
 function searchEntries(entries, query, options) {
   const { sourceId, maxResults = 5 } = options || {};
   const queryLower = query.toLowerCase();
-  const terms = queryLower.split(/\s+/).filter((t) => t.length > 1);
+  const rawTerms = queryLower.split(/\s+/).filter((t) => t.length > 1);
+  const meaningful = rawTerms.filter((t) => !STOPWORDS.has(t));
+  const terms = meaningful.length > 0 ? meaningful : rawTerms;
   let pool = entries;
   if (sourceId && sourceId !== "all") pool = pool.filter((e) => e.sourceId === sourceId);
   const scored = pool.map((entry) => {
@@ -21876,7 +21955,7 @@ var enabledSources = getEnabledSources();
 var sourceNames = enabledSources.map((s) => `${s.id} (${s.name})`).join(", ");
 var server = new McpServer({
   name: "agentcore-assistant",
-  version: "4.3.0",
+  version: "4.4.0",
   description: `Amazon Bedrock AgentCore is a fully managed AWS platform for building, deploying, and operating AI agents at scale. It provides: Runtime (serverless agent hosting with session isolation in microVMs, supporting any framework \u2014 Strands, LangGraph, CrewAI, Google ADK, OpenAI Agents SDK), Harness (managed agent loop via configuration \u2014 no code needed), Memory (short-term and long-term memory with semantic, summary, user-preference, and episodic strategies), Gateway (unified AI gateway connecting agents to tools via MCP, HTTP, and inference routing with 1-click integrations for Slack, Jira, Salesforce), Identity (workload identity, OAuth, API keys, Token Vault), Browser (managed remote Chrome for web automation), Code Interpreter (sandboxed Python/JS/TS execution), Web Search (managed search with no API keys), Observability (OpenTelemetry tracing via CloudWatch), Policy (Cedar-based fine-grained access control), Evaluations (13 built-in evaluators for continuous quality scoring), and Agent Registry (discover and share agents across an org). This MCP server provides live documentation, API references, boto3 methods, Python SDK, CDK constructs (TypeScript/Python/Java/.NET/Go), CloudFormation templates, and FAQs from ${enabledSources.length} official AWS sources (${enabledSources.map((s) => s.id).join(", ")}). Uses stdio transport \u2014 no ports, no conflicts. All content fetched dynamically \u2014 never stale.`
 });
 server.tool(
@@ -21939,6 +22018,8 @@ server.tool(
 
 Returns ranked results with live content snippets. The index covers 1800+ pages across all enabled sources, dynamically discovered from official AWS manifests.
 
+The top 3 results with distinct URLs are hydrated with a live 1500-character snippet; any further results (up to \`max_results\`) are listed as links only. Raising \`max_results\` gets you more links, not more snippets \u2014 use \`fetch_agentcore_doc\` on a URL for its full content.
+
 Filter by source to narrow results:
 - "docs" \u2014 Developer guide (how-to, concepts, getting started)
 - "api_data_plane" \u2014 API operations for invoking agents, memory, browser, etc.
@@ -21982,8 +22063,16 @@ Index has ${index.length} pages across ${enabledSources.length} sources.`
         }]
       };
     }
+    const toHydrate = [];
+    const hydratedUrls = /* @__PURE__ */ new Set();
+    for (const entry of results) {
+      if (toHydrate.length >= 3) break;
+      if (hydratedUrls.has(entry.url)) continue;
+      hydratedUrls.add(entry.url);
+      toHydrate.push(entry);
+    }
     const hydrated = [];
-    for (const entry of results.slice(0, 3)) {
+    for (const entry of toHydrate) {
       try {
         const content = await fetchDocPage(entry.url);
         const snippet = content.slice(0, 1500);
@@ -22006,7 +22095,7 @@ ${snippet}${content.length > 1500 ? "\n\n*[Truncated \u2014 use fetch_agentcore_
         );
       }
     }
-    const remaining = results.slice(3);
+    const remaining = results.filter((e) => !toHydrate.includes(e));
     let remainingText = "";
     if (remaining.length > 0) {
       remainingText = "\n\n---\n\n**More results:**\n" + remaining.map((e) => `- [${e.title}](${e.url}) [${e.sourceId}]${e.description ? ` \u2014 ${e.description}` : ""}`).join("\n");
@@ -22028,23 +22117,55 @@ Use when search snippets are truncated and you need:
 
 Works with any URL from the search results \u2014 developer guide, API reference, boto3 reference, or SDK pages.
 
+Returns at most 20000 characters per call. Large pages (the CDK references run
+past 150000 characters) are truncated, and the truncation notice reports the
+total length and the exact \`offset\` to pass next. Page through with \`offset\`
+to reach content beyond the first window \u2014 that is the only way to read the
+later part of a single-page reference, since there is no narrower page to ask for.
+
 Results are cached locally (default 60 min TTL) so repeated fetches are instant.`,
   {
-    url: external_exports.string().describe("Full URL to fetch from search results")
+    url: external_exports.string().describe("Full URL to fetch from search results"),
+    offset: external_exports.number().min(0).optional().describe("Character offset to start from. Use the value reported in a previous truncation notice to page through a large page. Default: 0")
   },
-  async ({ url }) => {
+  async ({ url, offset }) => {
+    if (!isAllowedDocUrl(url)) {
+      return {
+        content: [{
+          type: "text",
+          text: `Refused to fetch ${url}
+
+This tool only fetches https pages from the AgentCore documentation hosts it indexes: ${getAllowedHosts().join(", ")}.
+
+Use search_agentcore_docs to find a documentation URL.`
+        }]
+      };
+    }
     try {
       const content = await fetchDocPage(url);
       const MAX_CHARS = 2e4;
-      const body = content.length > MAX_CHARS ? `${content.slice(0, MAX_CHARS)}
+      const start = Math.min(offset ?? 0, content.length);
+      const body = content.slice(start, start + MAX_CHARS);
+      const end = start + body.length;
+      let notice = "";
+      if (start > 0) {
+        notice += `*[Resumed at character ${start} of ${content.length}.]*
 
-*[Truncated at ${MAX_CHARS} characters \u2014 page is ${content.length} characters. Ask for a narrower section or a different page if you need more.]*` : content;
+`;
+      }
+      if (end < content.length) {
+        notice = `${notice}${body}
+
+*[Truncated at ${end} of ${content.length} characters \u2014 call again with offset=${end} for the next section.]*`;
+      } else {
+        notice += body;
+      }
       return {
         content: [{ type: "text", text: `**Source:** ${url}
 
 ---
 
-${body}` }]
+${notice}` }]
       };
     } catch (err) {
       return {
