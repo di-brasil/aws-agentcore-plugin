@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Minimal MCP stdio client: spawn a server build, call one tool, print the text.
 //   node scripts/mcp-call.mjs <dist/index.js> <tool_name> '<json args>'
-// Used by verify-fixes.sh to probe two builds with identical calls.
+// Used by verify-fixes-v2.sh to probe two builds with identical calls.
 
 import { spawn } from "node:child_process";
 
