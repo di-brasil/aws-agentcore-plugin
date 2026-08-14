@@ -189,6 +189,88 @@ Tip: Call list_agentcore_components first to understand available terminology.`,
   }
 );
 
+/** Last path segment of a doc URL without the .html extension, lowercased. */
+function urlSlug(url: string): string {
+  try {
+    const path = new URL(url).pathname.replace(/\/+$/, "");
+    const last = path.split("/").pop() || "";
+    return last.replace(/\.html?$/i, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+/** Directory portion of a URL — origin + path up to and including the last slash. */
+function urlDir(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.origin}${u.pathname.replace(/[^/]*$/, "")}`;
+  } catch {
+    return "";
+  }
+}
+
+/** Normalized Levenshtein similarity in [0,1] over alphanumerics; 1 = identical. */
+function slugSimilarity(a: string, b: string): number {
+  const s = a.replace(/[^a-z0-9]/g, "");
+  const t = b.replace(/[^a-z0-9]/g, "");
+  if (!s || !t) return 0;
+  if (s === t) return 1;
+  const m = s.length;
+  const n = t.length;
+  const dp = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const tmp = dp[j];
+      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + (s[i - 1] === t[j - 1] ? 0 : 1));
+      prev = tmp;
+    }
+  }
+  return 1 - dp[n] / Math.max(m, n);
+}
+
+/**
+ * When a doc URL is gone or renamed, recover the real page from the loaded
+ * index: pick the index entry in the same doc directory whose slug is the
+ * closest match to the requested one (e.g. `memory-getting-started` →
+ * `memory-get-started`). Returns the recovered page, or null when nothing is
+ * close enough — meaning the content was genuinely removed, not just renamed.
+ */
+async function recoverRenamedDoc(requestedUrl: string): Promise<{ url: string; title: string; content: string } | null> {
+  const slug = urlSlug(requestedUrl);
+  const dir = urlDir(requestedUrl);
+  if (!slug || !dir) return null;
+
+  let index;
+  try {
+    index = await getIndex();
+  } catch {
+    return null;
+  }
+
+  let best: { url: string; title: string; score: number } | null = null;
+  for (const entry of index) {
+    if (urlDir(entry.url) !== dir) continue; // stay within the same doc section
+    const cand = urlSlug(entry.url);
+    if (!cand || cand === slug) continue; // skip empty or the identical (dead) slug
+    const score = slugSimilarity(slug, cand);
+    if (!best || score > best.score) {
+      best = { url: entry.url, title: entry.title, score };
+    }
+  }
+
+  if (!best || best.score < 0.6) return null; // no confident match
+
+  try {
+    const content = await fetchDocPage(best.url);
+    return { url: best.url, title: best.title, content };
+  } catch {
+    return null; // recovered candidate is also unavailable
+  }
+}
+
 server.tool(
   "fetch_agentcore_doc",
   `Fetch the full content of a documentation page by URL. Returns the complete page converted to Markdown.
@@ -242,6 +324,27 @@ Results are cached locally (default 60 min TTL) so repeated fetches are instant.
         content: [{ type: "text", text: `**Source:** ${url}\n\n---\n\n${notice}` }]
       };
     } catch (err) {
+      if (err instanceof PageUnavailableError) {
+        const recovered = await recoverRenamedDoc(url);
+        if (recovered) {
+          return {
+            content: [{
+              type: "text",
+              text: `*Note: \`${url}\` is no longer available (removed or renamed). ` +
+                    `Showing the closest current page instead.*\n\n` +
+                    `**Source:** ${recovered.url}\n\n---\n\n${clamp(recovered.content)}`
+            }]
+          };
+        }
+        return {
+          content: [{
+            type: "text",
+            text: `\`${url}\` is no longer available — the page appears to have been removed or renamed, ` +
+                  `and no close replacement was found in the index. ` +
+                  `Use \`search_agentcore_docs\` to find the current page for this topic.`
+          }]
+        };
+      }
       return {
         content: [{ type: "text", text: `Failed to fetch ${url}: ${(err as Error).message}` }]
       };
