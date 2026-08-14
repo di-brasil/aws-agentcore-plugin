@@ -36,14 +36,48 @@ export function clearCache(): void {
 }
 
 /**
- * Fetch raw content from a URL. Follows redirects, times out at 15s.
+ * Thrown when a requested doc URL resolves to no real article content —
+ * typically because the page was removed or renamed and AWS 302-redirects
+ * it to the section root, which serves only a tiny client-side redirect
+ * shell. Carries the final landing URL so callers can attempt recovery or
+ * report precisely where the request ended up instead of returning junk.
  */
-export function fetchRawUrl(url: string): Promise<string> {
+export class PageUnavailableError extends Error {
+  readonly requestedUrl: string;
+  readonly finalUrl: string;
+  constructor(requestedUrl: string, finalUrl: string) {
+    const where = finalUrl && finalUrl !== requestedUrl ? ` (redirected to ${finalUrl})` : "";
+    super(`No article content for ${requestedUrl}${where} — the page may have been removed or renamed.`);
+    this.name = "PageUnavailableError";
+    this.requestedUrl = requestedUrl;
+    this.finalUrl = finalUrl;
+  }
+}
+
+interface RawResult {
+  body: string;
+  /** URL the request actually ended at, after following any redirects. */
+  finalUrl: string;
+}
+
+/**
+ * Fetch raw content from a URL, following redirects (max 5) and reporting the
+ * final landing URL. Times out at 15s.
+ */
+function fetchRawWithMeta(url: string, redirectCount = 0): Promise<RawResult> {
   return new Promise((resolve, reject) => {
+    if (redirectCount > 5) {
+      reject(new Error(`Too many redirects for ${url}`));
+      return;
+    }
     const client = url.startsWith("https") ? https : http;
     const req = client.get(url, { headers: { "User-Agent": "AgentCore-Assistant/4.3" } }, (res) => {
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        fetchRawUrl(res.headers.location).then(resolve).catch(reject);
+        // Resolve the (possibly relative) Location against the current URL so
+        // the final URL we report is always absolute.
+        const next = new URL(res.headers.location, url).toString();
+        res.resume(); // drain the redirect response so the socket can be reused
+        fetchRawWithMeta(next, redirectCount + 1).then(resolve).catch(reject);
         return;
       }
       if (res.statusCode && res.statusCode >= 400) {
@@ -52,7 +86,7 @@ export function fetchRawUrl(url: string): Promise<string> {
       }
       const chunks: Buffer[] = [];
       res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+      res.on("end", () => resolve({ body: Buffer.concat(chunks).toString("utf-8"), finalUrl: url }));
       res.on("error", reject);
     });
     req.on("error", reject);
@@ -61,6 +95,13 @@ export function fetchRawUrl(url: string): Promise<string> {
       reject(new Error(`Timeout fetching ${url}`));
     });
   });
+}
+
+/**
+ * Fetch raw content from a URL. Follows redirects, times out at 15s.
+ */
+export function fetchRawUrl(url: string): Promise<string> {
+  return fetchRawWithMeta(url).then((r) => r.body);
 }
 
 /**
@@ -255,9 +296,34 @@ function htmlToMarkdownInner(html: string): string {
   return content;
 }
 
+/** Compare two URLs by host + path only (ignoring query/fragment/trailing slash). */
+function samePath(a: string, b: string): boolean {
+  try {
+    const ua = new URL(a);
+    const ub = new URL(b);
+    return ua.host === ub.host && ua.pathname.replace(/\/+$/, "") === ub.pathname.replace(/\/+$/, "");
+  } catch {
+    return a === b;
+  }
+}
+
+/**
+ * AWS serves a tiny client-side `meta refresh` / frameset stub (well under 2KB,
+ * no article body) when a page has been removed or renamed and the request is
+ * 302-redirected to the section root. Detect that shape so we don't hand back
+ * near-empty content as if the fetch succeeded.
+ */
+function looksLikeRedirectShell(html: string): boolean {
+  return html.length < 2000 && (/http-equiv=["']?refresh/i.test(html) || /<frame\b/i.test(html));
+}
+
 /**
  * Fetch a documentation page, convert to Markdown, and cache.
  * Returns cached content if within TTL, otherwise re-fetches.
+ *
+ * Throws PageUnavailableError when the URL resolves to no real content — a
+ * redirect shell, or a redirect to a different path that yields near-empty
+ * output — rather than silently returning the empty stub.
  */
 export async function fetchDocPage(url: string): Promise<string> {
   const ttl = getCacheTTL();
@@ -267,8 +333,14 @@ export async function fetchDocPage(url: string): Promise<string> {
     return cached.content;
   }
 
-  const html = await fetchRawUrl(url);
-  const markdown = htmlToMarkdown(html);
+  const { body, finalUrl } = await fetchRawWithMeta(url);
+  const markdown = htmlToMarkdown(body);
+
+  const redirectedAway = !samePath(url, finalUrl);
+  const nearEmpty = markdown.trim().length < 200;
+  if (looksLikeRedirectShell(body) || (redirectedAway && nearEmpty)) {
+    throw new PageUnavailableError(url, finalUrl);
+  }
 
   cache.set(url, { content: markdown, timestamp: Date.now() });
 
