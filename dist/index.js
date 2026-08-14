@@ -6593,6 +6593,7 @@ var require_formats = __commonJS({
       // uri-template: https://tools.ietf.org/html/rfc6570
       "uri-template": /^(?:(?:[^\x00-\x20"'<>%\\^`{|}]|%[0-9a-f]{2})|\{[+#./;?&=,!@|]?(?:[a-z0-9_]|%[0-9a-f]{2})+(?::[1-9][0-9]{0,3}|\*)?(?:,(?:[a-z0-9_]|%[0-9a-f]{2})+(?::[1-9][0-9]{0,3}|\*)?)*\})*$/i,
       // For the source: https://gist.github.com/dperini/729294
+      // For test cases: https://mathiasbynens.be/demo/url-regex
       url: /^(?:https?|ftp):\/\/(?:\S+(?::\S*)?@)?(?:(?!(?:10|127)(?:\.\d{1,3}){3})(?!(?:169\.254|192\.168)(?:\.\d{1,3}){2})(?!172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(?:[1-9]\d?|1\d\d|2[01]\d|22[0-3])(?:\.(?:1?\d{1,2}|2[0-4]\d|25[0-5])){2}(?:\.(?:[1-9]\d?|1\d\d|2[0-4]\d|25[0-4]))|(?:(?:[a-z0-9\u{00a1}-\u{ffff}]+-)*[a-z0-9\u{00a1}-\u{ffff}]+)(?:\.(?:[a-z0-9\u{00a1}-\u{ffff}]+-)*[a-z0-9\u{00a1}-\u{ffff}]+)*(?:\.(?:[a-z\u{00a1}-\u{ffff}]{2,})))(?::\d{2,5})?(?:\/[^\s]*)?$/iu,
       email: /^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i,
       hostname: /^(?=.{1,253}\.?$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[-0-9a-z]{0,61}[0-9a-z])?)*\.?$/i,
@@ -21110,12 +21111,29 @@ function getCacheTTL() {
   }
   return DEFAULT_TTL_MS;
 }
-function fetchRawUrl(url) {
+var PageUnavailableError = class extends Error {
+  requestedUrl;
+  finalUrl;
+  constructor(requestedUrl, finalUrl) {
+    const where = finalUrl && finalUrl !== requestedUrl ? ` (redirected to ${finalUrl})` : "";
+    super(`No article content for ${requestedUrl}${where} \u2014 the page may have been removed or renamed.`);
+    this.name = "PageUnavailableError";
+    this.requestedUrl = requestedUrl;
+    this.finalUrl = finalUrl;
+  }
+};
+function fetchRawWithMeta(url, redirectCount = 0) {
   return new Promise((resolve, reject) => {
+    if (redirectCount > 5) {
+      reject(new Error(`Too many redirects for ${url}`));
+      return;
+    }
     const client = url.startsWith("https") ? import_node_https.default : import_node_http.default;
     const req = client.get(url, { headers: { "User-Agent": "AgentCore-Assistant/4.3" } }, (res) => {
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        fetchRawUrl(res.headers.location).then(resolve).catch(reject);
+        const next = new URL(res.headers.location, url).toString();
+        res.resume();
+        fetchRawWithMeta(next, redirectCount + 1).then(resolve).catch(reject);
         return;
       }
       if (res.statusCode && res.statusCode >= 400) {
@@ -21124,7 +21142,7 @@ function fetchRawUrl(url) {
       }
       const chunks = [];
       res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+      res.on("end", () => resolve({ body: Buffer.concat(chunks).toString("utf-8"), finalUrl: url }));
       res.on("error", reject);
     });
     req.on("error", reject);
@@ -21133,6 +21151,9 @@ function fetchRawUrl(url) {
       reject(new Error(`Timeout fetching ${url}`));
     });
   });
+}
+function fetchRawUrl(url) {
+  return fetchRawWithMeta(url).then((r) => r.body);
 }
 function extractBalancedTag(html, tagName, openTagRegex) {
   const openMatch = html.match(openTagRegex);
@@ -21268,14 +21289,31 @@ function htmlToMarkdownInner(html) {
   content = content.trim();
   return content;
 }
+function samePath(a, b) {
+  try {
+    const ua = new URL(a);
+    const ub = new URL(b);
+    return ua.host === ub.host && ua.pathname.replace(/\/+$/, "") === ub.pathname.replace(/\/+$/, "");
+  } catch {
+    return a === b;
+  }
+}
+function looksLikeRedirectShell(html) {
+  return html.length < 2e3 && (/http-equiv=["']?refresh/i.test(html) || /<frame\b/i.test(html));
+}
 async function fetchDocPage(url) {
   const ttl = getCacheTTL();
   const cached2 = cache.get(url);
   if (cached2 && Date.now() - cached2.timestamp < ttl) {
     return cached2.content;
   }
-  const html = await fetchRawUrl(url);
-  const markdown = htmlToMarkdown(html);
+  const { body, finalUrl } = await fetchRawWithMeta(url);
+  const markdown = htmlToMarkdown(body);
+  const redirectedAway = !samePath(url, finalUrl);
+  const nearEmpty = markdown.trim().length < 200;
+  if (looksLikeRedirectShell(body) || redirectedAway && nearEmpty) {
+    throw new PageUnavailableError(url, finalUrl);
+  }
   cache.set(url, { content: markdown, timestamp: Date.now() });
   return markdown;
 }
@@ -22016,6 +22054,70 @@ ${snippet}${content.length > 1500 ? "\n\n*[Truncated \u2014 use fetch_agentcore_
     };
   }
 );
+function urlSlug(url) {
+  try {
+    const path = new URL(url).pathname.replace(/\/+$/, "");
+    const last = path.split("/").pop() || "";
+    return last.replace(/\.html?$/i, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+function urlDir(url) {
+  try {
+    const u = new URL(url);
+    return `${u.origin}${u.pathname.replace(/[^/]*$/, "")}`;
+  } catch {
+    return "";
+  }
+}
+function slugSimilarity(a, b) {
+  const s = a.replace(/[^a-z0-9]/g, "");
+  const t = b.replace(/[^a-z0-9]/g, "");
+  if (!s || !t) return 0;
+  if (s === t) return 1;
+  const m = s.length;
+  const n = t.length;
+  const dp = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const tmp = dp[j];
+      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + (s[i - 1] === t[j - 1] ? 0 : 1));
+      prev = tmp;
+    }
+  }
+  return 1 - dp[n] / Math.max(m, n);
+}
+async function recoverRenamedDoc(requestedUrl) {
+  const slug = urlSlug(requestedUrl);
+  const dir = urlDir(requestedUrl);
+  if (!slug || !dir) return null;
+  let index;
+  try {
+    index = await getIndex();
+  } catch {
+    return null;
+  }
+  let best = null;
+  for (const entry of index) {
+    if (urlDir(entry.url) !== dir) continue;
+    const cand = urlSlug(entry.url);
+    if (!cand || cand === slug) continue;
+    const score = slugSimilarity(slug, cand);
+    if (!best || score > best.score) {
+      best = { url: entry.url, title: entry.title, score };
+    }
+  }
+  if (!best || best.score < 0.6) return null;
+  try {
+    const content = await fetchDocPage(best.url);
+    return { url: best.url, title: best.title, content };
+  } catch {
+    return null;
+  }
+}
 server.tool(
   "fetch_agentcore_doc",
   `Fetch the full content of a documentation page by URL. Returns the complete page converted to Markdown.
@@ -22033,20 +22135,43 @@ Results are cached locally (default 60 min TTL) so repeated fetches are instant.
     url: external_exports.string().describe("Full URL to fetch from search results")
   },
   async ({ url }) => {
-    try {
-      const content = await fetchDocPage(url);
-      const MAX_CHARS = 2e4;
-      const body = content.length > MAX_CHARS ? `${content.slice(0, MAX_CHARS)}
+    const MAX_CHARS = 2e4;
+    const clamp = (content) => content.length > MAX_CHARS ? `${content.slice(0, MAX_CHARS)}
 
 *[Truncated at ${MAX_CHARS} characters \u2014 page is ${content.length} characters. Ask for a narrower section or a different page if you need more.]*` : content;
+    try {
+      const content = await fetchDocPage(url);
       return {
         content: [{ type: "text", text: `**Source:** ${url}
 
 ---
 
-${body}` }]
+${clamp(content)}` }]
       };
     } catch (err) {
+      if (err instanceof PageUnavailableError) {
+        const recovered = await recoverRenamedDoc(url);
+        if (recovered) {
+          return {
+            content: [{
+              type: "text",
+              text: `*Note: \`${url}\` is no longer available (removed or renamed). Showing the closest current page instead.*
+
+**Source:** ${recovered.url}
+
+---
+
+${clamp(recovered.content)}`
+            }]
+          };
+        }
+        return {
+          content: [{
+            type: "text",
+            text: `\`${url}\` is no longer available \u2014 the page appears to have been removed or renamed, and no close replacement was found in the index. Use \`search_agentcore_docs\` to find the current page for this topic.`
+          }]
+        };
+      }
       return {
         content: [{ type: "text", text: `Failed to fetch ${url}: ${err.message}` }]
       };
